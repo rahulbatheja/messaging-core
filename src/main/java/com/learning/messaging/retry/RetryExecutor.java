@@ -10,9 +10,10 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
-import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 @Slf4j
 @Component
@@ -42,50 +43,59 @@ public class RetryExecutor<T> {
         meterRegistry.counter(metricName, "topic", topic).increment();
     }
 
-    public void retry(String topic, String key, T event, Runnable task) {
-        String traceId = MDC.get("traceId");
-        if (traceId == null) {
-            traceId = UUID.randomUUID().toString();
-            MDC.put("traceId", traceId);
-        }
-        attempt(topic, key, event, task, 1, traceId);
+    public <R> CompletableFuture<R> executeWithRetry(String topic, String key, T event, Supplier<CompletableFuture<R>> taskSupplier) {
+        CompletableFuture<R> resultFuture = new CompletableFuture<>();
+        attempt(topic, key, event, taskSupplier, resultFuture, 1);
+        return resultFuture;
     }
 
-    private void attempt(String topic, String key, T event, Runnable task, int attemptNo, String traceId) {
+    private <R> void attempt(String topic, String key, T event, Supplier<CompletableFuture<R>> taskSupplier,
+                             CompletableFuture<R> outer, int attemptNo) {
+        String traceId = MDC.get("traceId");
+        log.debug("Attempt start [topic={}, key={}, attempt={}, traceId={}]", topic, key, attemptNo, traceId);
         try {
-            task.run();
-            log.info("Retry success [topic={}, key={}, attempt={}, traceId={}]",
-                    topic, key, attemptNo, traceId);
-            count(METRIC_SUCCESS, topic);
+            CompletableFuture<R> attemptFuture = taskSupplier.get();
+            attemptFuture.whenComplete((result, exception) -> {
+                if (exception == null) {
+                    log.info("Retry attempt success [topic={}, key={}, attempt={}, traceId={}]", topic, key, attemptNo, traceId);
+                    count(METRIC_SUCCESS, topic);
+                    outer.complete(result);
+                } else {
+                    long delayMs = props.backoffForAttempt(attemptNo);
+
+                    if (attemptNo < props.getMaxAttempts()) {
+                        log.warn("Retry attempt failed → scheduling retry [topic={}, key={}, attempt={}, nextAttempt={}, delayMs={}, traceId={}, error={}]",
+                                topic, key, attemptNo, attemptNo + 1, delayMs, traceId, exception.toString());
+
+                        count(METRIC_SCHEDULED, topic);
+
+                        this.scheduler.schedule(() ->
+                                        attempt(topic, key, event, taskSupplier, outer, attemptNo + 1),
+                                delayMs,
+                                TimeUnit.MILLISECONDS
+                        );
+                    } else {
+                        log.error("Retry exhausted [topic={}, key={}, attempts={}, traceId={}, error={}]",
+                                topic, key, props.getMaxAttempts(), traceId, exception.toString());
+
+                        count(METRIC_EXHAUSTED, topic);
+
+                        RetryableSendException rse =
+                                new RetryableSendException(topic, key, event, traceId, exception);
+                        exhaustedHandlers.forEach(h -> h.onExhausted(rse));
+
+                        outer.completeExceptionally(rse);
+
+                    }
+                }
+            });
         } catch (Exception exception) {
-            log.warn(" Retry failed [topic={}, key={}, attempt={}, traceId={}, error={}]",
-                    topic, key, attemptNo, traceId, exception.toString());
-
-            if (attemptNo < props.getMaxAttempts()) {
-                long delayMs = props.backoffForAttempt(attemptNo);
-                log.debug(" Scheduling retry [topic={}, key={}, nextAttempt={}, delayMs={}, traceId={}]",
-                        topic, key, attemptNo + 1, delayMs, traceId);
-
-                count(METRIC_SCHEDULED, topic);
-
-                this.scheduler.schedule(() -> {
-                    attempt(topic, key, event, task, attemptNo + 1, traceId);
-                }, delayMs, TimeUnit.MILLISECONDS);
-            } else {
-                log.error("Retry exhausted [topic={}, key={}, attempts={}, traceId={}, error={}]",
-                        topic, key, props.getMaxAttempts(), traceId, exception.toString());
-
-                count(METRIC_EXHAUSTED, topic);
-
-                RetryableSendException retryableSendException =
-                        new RetryableSendException(topic, key, event, traceId, exception);
-
-                exhaustedHandlers.forEach(handler -> handler.onExhausted(retryableSendException));
-            }
-
+            outer.completeExceptionally(exception);
         } finally {
-            MDC.clear();
+            MDC.remove("traceId");
         }
+
+
     }
 
 }
